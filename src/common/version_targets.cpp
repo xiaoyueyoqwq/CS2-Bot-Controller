@@ -121,6 +121,12 @@ bool LoadFromSchema(char* errorOut, size_t errorOutLen)
     const int initialVelocity = schema::GetFieldOffset("CBaseCSGrenadeProjectile", "m_vInitialVelocity");
     if (initialPosition >= 0) g_projectileInitialPosition = initialPosition;
     if (initialVelocity >= 0) g_projectileInitialVelocity = initialVelocity;
+
+    const int wsPawn = schema::GetFieldOffset("CPlayerPawnComponent", "m_pPawn");
+    if (wsPawn >= 0) g_wsPawn = wsPawn;
+
+    const int myWeapons = schema::GetFieldOffset("CPlayer_WeaponServices", "m_hMyWeapons");
+    if (myWeapons >= 0) g_wsMyWeapons = myWeapons;
     return true;
 }
 } // namespace bot_controller::targets

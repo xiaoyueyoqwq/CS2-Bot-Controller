@@ -90,6 +90,12 @@ inline int g_projectileInitialVelocity = -1;
 
 // m_hActiveWeapon (CHandle)
 inline int g_wsActiveWeapon = 0x60;
+// m_hMyWeapons CUtlVector base. Size is at +0x10, m_pElements at +0x18.
+// Default matches GetSlot on current libserver.so (size at ws+0x48, array at ws+0x50).
+inline int g_wsMyWeapons = 0x38;
+// CPlayerPawnComponent::m_pPawn — WeaponServices back-pointer to pawn.
+// Default matches CCSPlayer_MovementServices::Pawn (same component base).
+inline int g_wsPawn = 56;
 
 // ---- CBasePlayerWeapon ----
 

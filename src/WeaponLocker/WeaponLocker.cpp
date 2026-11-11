@@ -55,6 +55,68 @@ std::unordered_map<void*, WsBinding> g_wsToBinding; // NOLINT(bugprone-throwing-
 void* g_slotToWs[64] = { nullptr };
 std::mutex g_wsToSlotMu;
 
+// CUtlVector<CHandle>: m_Size at +0x10, m_pElements at +0x18 (64-bit Source2).
+constexpr int kCUtlVectorSize = 0x10;
+constexpr int kCUtlVectorElements = 0x18;
+constexpr int kMaxWeaponHandles = 64;
+
+bool IsCanonicalUserPointer(const void* pointer)
+{
+    const auto address = reinterpret_cast<uintptr_t>(pointer);
+    if (address < 0x10000U) return false;
+    const uintptr_t high = address >> 48;
+    const uintptr_t sign = (address >> 47) & 1U;
+    return sign == 0 ? high == 0 : high == 0xFFFFU;
+}
+
+bool WeaponVectorLooksSafe(void* ws)
+{
+    if (!ws) return false;
+    int size = 0;
+    if (!GuardedRead(ws, tg::g_wsMyWeapons + kCUtlVectorSize, size)) return false;
+    if (size < 0 || size > kMaxWeaponHandles) return false;
+    if (size == 0) return true;
+
+    void* elements = nullptr;
+    if (!GuardedRead(ws, tg::g_wsMyWeapons + kCUtlVectorElements, elements)) return false;
+    if (!IsCanonicalUserPointer(elements)) return false;
+
+    uint32_t firstHandle = 0;
+    return GuardedRead(elements, 0, firstHandle);
+}
+
+bool CachedWsStillBoundToPawn(void* ws, void* pawn)
+{
+    if (!ws || !pawn) return false;
+    void* liveWs = nullptr;
+    if (!GuardedRead(pawn, tg::g_pawnWeaponServices, liveWs) || liveWs != ws) return false;
+    if (tg::g_wsPawn >= 0)
+    {
+        void* backPawn = nullptr;
+        if (GuardedRead(ws, tg::g_wsPawn, backPawn) && backPawn && backPawn != pawn) return false;
+    }
+    return WeaponVectorLooksSafe(ws);
+}
+
+bool ShouldSkipEngineEquip(void* bot)
+{
+    if (!bot) return true;
+    void* pawn = nullptr;
+    if (!GuardedRead(bot, tg::g_botPawn, pawn) || !pawn) return true;
+    void* ws = nullptr;
+    if (!GuardedRead(pawn, tg::g_pawnWeaponServices, ws) || !ws) return true;
+    return !WeaponVectorLooksSafe(ws);
+}
+
+void ForgetSlotLocked(int slot)
+{
+    void* ws = g_slotToWs[slot];
+    g_slotToWs[slot] = nullptr;
+    if (!ws) return;
+    auto it = g_wsToBinding.find(ws);
+    if (it != g_wsToBinding.end() && it->second.slot == slot) g_wsToBinding.erase(it);
+}
+
 void RememberWsForBot(void* bot, int slot)
 {
     if (!bot || slot < 0 || slot >= 64) return;
@@ -64,7 +126,11 @@ void RememberWsForBot(void* bot, int slot)
     void* ws = nullptr;
     if (!GuardedRead(pawn, tg::g_pawnWeaponServices, ws)) return;
     if (!ws) return;
+    if (!WeaponVectorLooksSafe(ws)) return;
     std::scoped_lock lk(g_wsToSlotMu);
+    if (g_slotToWs[slot] && g_slotToWs[slot] != ws) ForgetSlotLocked(slot);
+    auto it = g_wsToBinding.find(ws);
+    if (it != g_wsToBinding.end() && it->second.slot != slot) g_slotToWs[it->second.slot] = nullptr;
     g_wsToBinding[ws] = { .slot = slot, .pawn = pawn };
     g_slotToWs[slot] = ws;
 }
@@ -75,6 +141,13 @@ WsBinding LookupBindingForWs(void* ws)
     std::scoped_lock lk(g_wsToSlotMu);
     auto it = g_wsToBinding.find(ws);
     return it == g_wsToBinding.end() ? WsBinding{ .slot = -1, .pawn = nullptr } : it->second;
+}
+
+void* SafeGetSlot(void* ws, int engineSlot, unsigned int mask)
+{
+    if (!ws || !g_getSlot) return nullptr;
+    if (!WeaponVectorLooksSafe(ws)) return nullptr;
+    return g_getSlot(ws, engineSlot, mask);
 }
 
 // LockTarget -> engine weapon-slot index
@@ -96,6 +169,7 @@ void BC_FASTCALL HookedEquipBestWeapon(void* bot, char mustEquip)
     if (sr.slot >= 0 && motion_recorder::IsReplaying(sr.slot)) return;
     LockTarget lt = (sr.slot >= 0) ? weapon_locker_state::Get(sr.slot) : LockTarget::None;
     if (lt != LockTarget::None) return;
+    if (ShouldSkipEngineEquip(bot)) return;
     g_origEquipBestWeapon(bot, mustEquip);
 }
 
@@ -106,6 +180,7 @@ void BC_FASTCALL HookedEquipPistol(void* bot, char mustEquip)
     if (sr.slot >= 0 && motion_recorder::IsReplaying(sr.slot)) return;
     LockTarget lt = (sr.slot >= 0) ? weapon_locker_state::Get(sr.slot) : LockTarget::None;
     if (lt != LockTarget::None) return;
+    if (ShouldSkipEngineEquip(bot)) return;
     g_origEquipPistol(bot, mustEquip);
 }
 
@@ -122,8 +197,25 @@ char BC_FASTCALL HookedSelectItem(void* ws, void* weapon, int flag)
             }
     }
 
+    if (!WeaponVectorLooksSafe(ws))
+    {
+        WsBinding stale = LookupBindingForWs(ws);
+        if (stale.slot >= 0)
+        {
+            std::scoped_lock lk(g_wsToSlotMu);
+            ForgetSlotLocked(stale.slot);
+        }
+        return 0;
+    }
+
     WsBinding bind = LookupBindingForWs(ws);
     if (bind.slot < 0) return g_origSelectItem(ws, weapon, flag);
+    if (!CachedWsStillBoundToPawn(ws, bind.pawn))
+    {
+        std::scoped_lock lk(g_wsToSlotMu);
+        ForgetSlotLocked(bind.slot);
+        return g_origSelectItem(ws, weapon, flag);
+    }
 
     // Human took over this pawn -> current m_hController != bot slot
     // we cached; don't block player's weapon switches.
@@ -140,7 +232,7 @@ char BC_FASTCALL HookedSelectItem(void* ws, void* weapon, int flag)
 
     if (engineSlot == 3 && weapon && IsGrenadeDef(ReadDefIndex(weapon))) return g_origSelectItem(ws, weapon, flag);
 
-    void* targetWeapon = g_getSlot(ws, engineSlot, 0xFFFFFFFFU);
+    void* targetWeapon = SafeGetSlot(ws, engineSlot, 0xFFFFFFFFU);
     // No weapon in the locked slot -> can't enforce, let it through.
     if (!targetWeapon) return g_origSelectItem(ws, weapon, flag);
 
@@ -300,7 +392,7 @@ int ActiveWeaponDef(void* ws)
         for (unsigned int pos = 0; pos < maxPos; ++pos)
         {
             unsigned int posArg = (slot == 3) ? pos : 0xFFFFFFFFU;
-            void* w = g_getSlot(ws, slot, posArg);
+            void* w = SafeGetSlot(ws, slot, posArg);
             if (w && EntIndexOf(w) == activeIdx)
             {
                 int def = ReadDefIndex(w);
@@ -318,18 +410,18 @@ void* FindWeaponByDef(void* ws, int def)
 {
     if (!ws || def < 0 || !g_getSlot) return nullptr;
     // kKnifeDef means "the bot's own slot-2 knife", whatever skin it is.
-    if (def == kKnifeDef) return g_getSlot(ws, 2, 0xFFFFFFFFU);
+    if (def == kKnifeDef) return SafeGetSlot(ws, 2, 0xFFFFFFFFU);
     // Non-grenade gear slots hold one weapon each
     for (int slot = 0; slot <= 4; ++slot)
     {
         if (slot == 3) continue;
-        void* w = g_getSlot(ws, slot, 0xFFFFFFFFU);
+        void* w = SafeGetSlot(ws, slot, 0xFFFFFFFFU);
         if (w && ReadDefIndex(w) == def) return w;
     }
     // GEAR_SLOT_GRENADES (3) holds every grenade type at once
     for (unsigned int pos = 0; pos < 8; ++pos)
     {
-        void* w = g_getSlot(ws, 3, pos);
+        void* w = SafeGetSlot(ws, 3, pos);
         if (w && ReadDefIndex(w) == def) return w;
     }
     return nullptr;
@@ -338,15 +430,40 @@ void* FindWeaponByDef(void* ws, int def)
 bool SelectWeaponRaw(void* ws, void* weapon)
 {
     if (!ws || !weapon || !g_origSelectItem) return false;
+    if (!WeaponVectorLooksSafe(ws)) return false;
     g_origSelectItem(ws, weapon, 0);
     return true;
+}
+
+void ForgetSlot(int slot)
+{
+    if (slot < 0 || slot >= 64) return;
+    std::scoped_lock lk(g_wsToSlotMu);
+    ForgetSlotLocked(slot);
+}
+
+void ForgetAll()
+{
+    std::scoped_lock lk(g_wsToSlotMu);
+    g_wsToBinding.clear();
+    for (auto& slotToWs : g_slotToWs)
+        slotToWs = nullptr;
 }
 
 void* WsForSlot(int slot)
 {
     if (slot < 0 || slot >= 64) return nullptr;
     std::scoped_lock lk(g_wsToSlotMu);
-    return g_slotToWs[slot];
+    void* ws = g_slotToWs[slot];
+    if (!ws) return nullptr;
+    auto it = g_wsToBinding.find(ws);
+    void* pawn = (it == g_wsToBinding.end()) ? nullptr : it->second.pawn;
+    if (!CachedWsStillBoundToPawn(ws, pawn))
+    {
+        ForgetSlotLocked(slot);
+        return nullptr;
+    }
+    return ws;
 }
 
 int SwitchToLockTarget(int slot)
@@ -360,14 +477,10 @@ int SwitchToLockTarget(int slot)
     int engineSlot = LockTargetToEngineSlot(lt);
     if (engineSlot < 0) return 3;
 
-    void* ws = nullptr;
-    {
-        std::scoped_lock lk(g_wsToSlotMu);
-        ws = g_slotToWs[slot];
-    }
+    void* ws = WsForSlot(slot);
     if (!ws) return 1; // bot hasn't ticked yet; lock will still take effect once AI runs.
 
-    void* target = g_getSlot(ws, engineSlot, 0xFFFFFFFFU);
+    void* target = SafeGetSlot(ws, engineSlot, 0xFFFFFFFFU);
     if (!target) return 2;
 
     // Route through the original (un-hooked) function so we don't

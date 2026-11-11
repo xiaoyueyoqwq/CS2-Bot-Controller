@@ -49,5 +49,11 @@ bool SelectWeaponRaw(void* ws, void* weapon);
 
 // Cached WeaponServices* for a bot slot
 void* WsForSlot(int slot);
+
+// Drop cached WeaponServices* for one player slot (ClientDisconnect)
+void ForgetSlot(int slot);
+
+// Drop every cached WeaponServices* (map change / unload)
+void ForgetAll();
 } // namespace weapon_locker_hooks
 } // namespace bot_controller

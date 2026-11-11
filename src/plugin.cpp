@@ -6,10 +6,12 @@
 #include <string>
 
 #include <eiface.h>
+#include <iserver.h>
 #include <icvar.h>
 #include <convar.h>
 #include <interfaces/interfaces.h>
 #include <networksystem/inetworkmessages.h>
+#include <playerslot.h>
 #include <tier0/dbg.h>
 
 #include <nlohmann/json.hpp> // NOLINT(misc-include-cleaner)
@@ -32,7 +34,12 @@
 #include "ProjectileBirthAlign.h"
 #include "version_targets.h"
 
-class BotControllerPlugin : public ISmmPlugin
+PLUGIN_GLOBALVARS();
+
+SH_DECL_HOOK5_void(
+    IServerGameClients, ClientDisconnect, SH_NOATTRIB, 0, CPlayerSlot, ENetworkDisconnectionReason, const char*, uint64, const char*);
+
+class BotControllerPlugin : public ISmmPlugin, public IMetamodListener
 {
   public:
     bool Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool late) override;
@@ -50,6 +57,14 @@ class BotControllerPlugin : public ISmmPlugin
     const char* GetVersion() override { return "0.6.3"; }
     const char* GetDate() override { return __DATE__; }
     const char* GetLogTag() override { return "BC"; }
+
+    void OnLevelInit(char const* pMapName, char const*, char const*, char const*, bool, bool) override;
+    void OnLevelShutdown() override;
+    void Hook_ClientDisconnect_Pre(
+        CPlayerSlot slot, ENetworkDisconnectionReason reason, const char* pszName, uint64 xuid, const char* pszNetworkID);
+
+  private:
+    IServerGameClients* m_gameClients = nullptr;
 };
 
 BotControllerPlugin g_botControllerPlugin; // NOLINT(misc-use-internal-linkage)
@@ -184,11 +199,62 @@ bool BotControllerPlugin::Load(PluginId id, ISmmAPI* ismm, char* error, size_t m
         Warning("[BotController] InputInjector::Install failed (%s); record/replay movement will be a no-op\n", injErr);
     }
 
+    m_gameClients = static_cast<IServerGameClients*>(serverIface);
+    g_SMAPI->AddListener(this, this);
+    SH_ADD_HOOK(IServerGameClients, ClientDisconnect, m_gameClients, SH_MEMBER(this, &BotControllerPlugin::Hook_ClientDisconnect_Pre),
+                false);
+
     return true;
+}
+
+namespace {
+
+void ForgetSlotLifecycle(int slot)
+{
+    bot_controller::weapon_locker_hooks::ForgetSlot(slot);
+    bot_controller::weapon_locker_state::Clear(slot);
+    bot_controller::bot_controller_state::SetAll(slot, false);
+    bot_controller::bot_controller_state::SetAim(slot, false);
+    bot_controller::buy_controller_state::Clear(slot);
+    bot_controller::motion_recorder::StopReplay(slot);
+}
+
+void ForgetAllLifecycle()
+{
+    bot_controller::weapon_locker_hooks::ForgetAll();
+    bot_controller::weapon_locker_state::ClearAll();
+    bot_controller::bot_controller_state::ClearAllAll();
+    bot_controller::bot_controller_state::ClearAllAim();
+    bot_controller::buy_controller_state::ClearAll();
+    for (int slot = 0; slot < bot_controller::weapon_locker_state::kMaxSlots; ++slot)
+        bot_controller::motion_recorder::StopReplay(slot);
+}
+
+} // namespace
+
+void BotControllerPlugin::OnLevelInit(char const* /*pMapName*/, char const*, char const*, char const*, bool, bool) {}
+
+void BotControllerPlugin::OnLevelShutdown()
+{
+    ForgetAllLifecycle();
+    Warning("[BotController] OnLevelShutdown - ws cache and slot locks cleared\n");
+}
+
+void BotControllerPlugin::Hook_ClientDisconnect_Pre(
+    CPlayerSlot slot, ENetworkDisconnectionReason /*reason*/, const char* /*pszName*/, uint64 /*xuid*/, const char* /*pszNetworkID*/)
+{
+    ForgetSlotLifecycle(slot.Get());
+    RETURN_META(MRES_IGNORED);
 }
 
 bool BotControllerPlugin::Unload(char* /*error*/, size_t /*maxlen*/)
 {
+    if (m_gameClients)
+    {
+        SH_REMOVE_HOOK(IServerGameClients, ClientDisconnect, m_gameClients,
+                       SH_MEMBER(this, &BotControllerPlugin::Hook_ClientDisconnect_Pre), false);
+        m_gameClients = nullptr;
+    }
     bot_controller::motion_recorder::ClearAll();
     bot_controller::projectile_birth_align::Clear();
     bot_controller::input_injector::Remove();
